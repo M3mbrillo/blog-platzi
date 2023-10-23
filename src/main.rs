@@ -1,8 +1,11 @@
+
 #[macro_use]
 extern crate diesel;
 
 pub mod models;
 pub mod schema;
+
+use tera::Tera;
 
 use dotenv::dotenv;
 use std::env;
@@ -10,73 +13,92 @@ use std::env;
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 
-fn main() {
-    dotenv().ok();
+use diesel::r2d2::{self, ConnectionManager};
+use diesel::r2d2::Pool;
 
+use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+
+pub type DbPool = r2d2::Pool<ConnectionManager<PgConnection>>;
+
+use self::models::Post;
+use self::schema::posts::dsl::*;
+
+
+#[get("/ping")]
+async fn ping_pong() -> impl Responder {
+    return HttpResponse::Ok().body("Pong!");
+}
+
+#[get("/")]
+async fn index(pool: web::Data<DbPool>, template_manager: web::Data<tera::Tera>) -> impl Responder {
+
+    let conn = pool.get().expect("Error try get db connection from pool");
+
+    return match web::block(move || {posts.limit(10).load::<Post>(&conn)}).await {
+        Ok(data) => { 
+
+            let mut ctx = tera::Context::new();
+
+            ctx.insert("posts", &data.unwrap());
+
+            HttpResponse::Ok()
+                .content_type("text/html")
+                .body(
+                    template_manager.render("index.html", &ctx).unwrap()
+                )
+        }
+        Err(err) => HttpResponse::Ok().body("Error to read data")
+    };
+}
+
+#[post("/post")]
+async fn create_post(pool: web::Data<DbPool>, item: web::Json<models::NewPostHandler>) -> impl Responder {
+    let conn = pool.get().expect("Error get a connection DB from the pool");
+
+    println!("{:?}", item);
+
+    match web::block(move || { Post::create_post(&conn, &item) }).await {
+        Ok(data) => HttpResponse::Ok().body(format!("{:?}", data)),
+        Err(err) => HttpResponse::Ok().body("Error to read data")
+    }
+}
+
+#[get("/tera")]
+async fn tera_index(template_manager: web::Data<tera::Tera>) -> impl Responder {
+
+    let ctx = tera::Context::new();
+
+    HttpResponse::Ok()
+        .content_type("text/html")
+        .body(
+            template_manager.render("index.html", &ctx)
+            .unwrap()
+        )
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+
+    dotenv().ok();
     let db_url = env::var("DATABASE_URL").expect("Dont setter DATABASE_URL");
 
-    let conn = PgConnection::establish(&db_url).expect("Error connecting to db");
+    let connection = ConnectionManager::<PgConnection>::new(db_url);
+    let pool = Pool::builder().build(connection).expect("Error build pool connection");
 
-    use self::models::{NewPost, Post, PostSimplificado};
-    use self::schema::posts;
-    use self::schema::posts::dsl::*;
+    HttpServer::new(move || {
 
-    // Insert
-    // let new_post = NewPost {
-    //     title: "My Title",
-    //     body: "My Body",
-    //     slug: "primer-post"
-    // };
+        let tera = Tera::new(concat!(env!("CARGO_MANIFEST_DIR"), "/templates/**/*")).unwrap();
 
-    //
-    // diesel::insert_into(posts::table)
-    //     .values(&new_post)
-    //     .get_result::<Post>(&conn)
-    //     .expect("Insert into Post fail!");
-
-    // Select * from post
-    // let posts_result = posts.load::<Post>(&conn).expect("Error reading Post table");
-
-    // for p in posts_result {
-    //     println!("p -> {}", p.title)
-    // }
-
-    // Select locos con where
-    // let posts_simplificado_result = posts
-    //     .order(id.desc())
-    //     .select((title, body))
-    //     .load::<PostSimplificado>(&conn)
-    //     .expect("Error reading Post table");
-
-    // for p in posts_simplificado_result {
-    //     println!("{:?}", p)
-    // }
-
-    // let posts_result = posts
-    //     .filter(self::schema::posts::dsl::slug.like("%segundo%"))
-    //     .load::<Post>(&conn).expect("Error reading Post table");
-
-    // for p in posts_result {
-    //     println!("{:?}", p)
-    // }
-
-    // Update
-    let filter_first_post = posts.filter(id.eq(1));
-    // let post_update = diesel::update(filter_first_post)
-    //     .set((
-    //         slug.eq("edited-slug"),
-    //         body.eq("edited-body")
-    //     )).get_result::<Post>(&conn);
-
-    // println!("{:?}", post_update);
-
-    // Delete
-    // diesel::delete(filter_first_post).execute(&conn).expect("Error deleting post");
-
-    // for post in posts.load::<Post>(&conn).expect("Error given all posts")
-    // {
-    //     println!("{:?}", post);
-    // }
-
-    println!("End!");
+        App::new()
+            // endpoints
+            .service(index)
+            .service(create_post)
+            .service(tera_index)
+            // Dependencies
+            .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(tera.clone()))
+    })
+    .bind(("0.0.0.0", 5700))
+    ?.run()
+    .await
 }
